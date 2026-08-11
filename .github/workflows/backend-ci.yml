@@ -1,0 +1,300 @@
+# ---------------------------------------------------------------------------
+# GameBackend - backend CI/CD (GitFlow)
+#
+#   feature/*  -> PR into develop : build + test + IaC validate
+#   develop    (push)             : full checks + package  -> deploy DEV
+#   release/*  -> PR into main    : full checks + package  -> deploy STAGING (gated)
+#   main       (tag v*)           : deploy PROD (manual approval via environment)
+#   hotfix/*   -> PR into main    : full checks, then back-merge to develop
+#
+# PR checks (build-and-test, validate-iac, package) require ZERO secrets and
+# never touch Azure. Only deploy-* jobs use a GitHub `environment:`, which is
+# where approvals and credentials are attached.
+# ---------------------------------------------------------------------------
+name: backend-ci
+
+on:
+  push:
+    branches:
+      - develop
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - develop
+      - main
+  workflow_dispatch:
+
+# Least privilege for the whole workflow. Deploy jobs opt in to `id-token: write`
+# individually if/when OIDC federated login to Azure is enabled.
+permissions:
+  contents: read
+
+concurrency:
+  group: backend-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  DOTNET_VERSION: '8.0.x'
+  DOTNET_NOLOGO: 'true'
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: 'true'
+  DOTNET_CLI_TELEMETRY_OPTOUT: 'true'
+  SOLUTION: GameBackend.sln
+  FUNCTION_PROJECT: src/GameBackend/GameBackend.csproj
+  BICEP_TEMPLATE: infra/main.bicep
+
+jobs:
+  # -------------------------------------------------------------------------
+  # 1. Compile + unit tests. Runs on every trigger, no secrets.
+  # -------------------------------------------------------------------------
+  build-and-test:
+    name: Build and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Report GitFlow stage
+        run: |
+          {
+            echo "### GitFlow stage"
+            echo ""
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| event | \`${{ github.event_name }}\` |"
+            echo "| ref | \`${{ github.ref_name }}\` |"
+            echo "| base | \`${{ github.base_ref || '-' }}\` |"
+            echo "| head | \`${{ github.head_ref || '-' }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Restore
+        run: dotnet restore ${{ env.SOLUTION }}
+
+      - name: Build
+        run: dotnet build ${{ env.SOLUTION }} -c Release --no-restore
+
+      - name: Test
+        run: |
+          dotnet test ${{ env.SOLUTION }} \
+            -c Release \
+            --no-build \
+            --logger "trx;LogFileName=test-results.trx" \
+            --results-directory ./TestResults \
+            --collect:"XPlat Code Coverage"
+
+      - name: Upload test results and coverage
+        # Upload even when tests fail - the .trx is how you triage the failure.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: ./TestResults/**
+          retention-days: 14
+          if-no-files-found: warn
+
+  # -------------------------------------------------------------------------
+  # 2. Infrastructure-as-code validation. Compiles the Bicep to ARM JSON.
+  #    Needs no Azure login, so it is safe on PRs from any branch.
+  # -------------------------------------------------------------------------
+  validate-iac:
+    name: Validate IaC (bicep build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # az is preinstalled on GitHub-hosted runners; `az bicep install` pulls the
+      # Bicep CLI. (Alternative: azure/CLI@v2, which runs az in a container.)
+      - name: Install Bicep CLI
+        run: az bicep install
+
+      - name: Show Bicep version
+        run: az bicep version
+
+      - name: Build Bicep template
+        run: az bicep build --file ${{ env.BICEP_TEMPLATE }} --stdout > /dev/null
+
+      - name: Lint summary
+        if: always()
+        run: echo "Bicep template \`${{ env.BICEP_TEMPLATE }}\` compiled." >> "$GITHUB_STEP_SUMMARY"
+
+  # -------------------------------------------------------------------------
+  # 3. Package the deployable zip.
+  #    Skipped for feature/* PRs into develop (nothing is deployed from those).
+  # -------------------------------------------------------------------------
+  package:
+    name: Package artifact
+    needs: [build-and-test, validate-iac]
+    if: >-
+      github.event_name == 'push' ||
+      github.event_name == 'workflow_dispatch' ||
+      github.base_ref == 'main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Publish
+        run: dotnet publish ${{ env.FUNCTION_PROJECT }} -c Release -o ./publish
+
+      - name: Zip publish output
+        # Zip from inside ./publish so host.json sits at the archive root, which
+        # is what the Functions zip-deploy / run-from-package expects.
+        run: |
+          cd ./publish
+          zip -r ../GameBackend.zip .
+
+      - name: Upload function package
+        uses: actions/upload-artifact@v4
+        with:
+          name: function-package
+          path: GameBackend.zip
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Upload IaC template
+        uses: actions/upload-artifact@v4
+        with:
+          name: iac-template
+          path: infra/main.bicep
+          retention-days: 30
+          if-no-files-found: error
+
+  # -------------------------------------------------------------------------
+  # 4a. DEV - every merge into develop. Environment `dev` has no reviewers,
+  #     so this is continuous deployment.
+  # -------------------------------------------------------------------------
+  deploy-dev:
+    name: Deploy to DEV
+    needs: [package]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: dev
+    steps:
+      - name: Download function package
+        uses: actions/download-artifact@v4
+        with:
+          name: function-package
+
+      - name: Deploy (documented placeholder)
+        run: |
+          echo "Would deploy GameBackend.zip to the dev Function App."
+          echo "Enable by adding an OIDC federated credential and uncommenting"
+          echo "the azure/login + az functionapp deployment steps below."
+      # Enable once an Azure service principal / OIDC federation exists.
+      # Requires job-level `permissions: { id-token: write, contents: read }`.
+      #
+      # - uses: azure/login@v2
+      #   with:
+      #     client-id: ${{ vars.AZURE_CLIENT_ID }}
+      #     tenant-id: ${{ vars.AZURE_TENANT_ID }}
+      #     subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      #
+      # - name: Deploy infrastructure
+      #   run: |
+      #     az deployment group create \
+      #       --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+      #       --template-file infra/main.bicep \
+      #       --parameters environment=dev \
+      #                    playFabTitleId="${{ vars.PLAYFAB_TITLE_ID }}" \
+      #                    playFabSecretUri="${{ vars.PLAYFAB_SECRET_URI }}"
+      #
+      # - name: Deploy application
+      #   run: |
+      #     az functionapp deployment source config-zip \
+      #       --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+      #       --name "${{ vars.AZURE_FUNCTIONAPP_NAME }}" \
+      #       --src GameBackend.zip
+
+  # -------------------------------------------------------------------------
+  # 4b. STAGING - release/* PR into main. Environment `staging` carries a
+  #     required reviewer, so the job parks on "waiting for approval".
+  # -------------------------------------------------------------------------
+  deploy-staging:
+    name: Deploy to STAGING
+    needs: [package]
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.base_ref == 'main' &&
+      startsWith(github.head_ref, 'release/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: staging
+    steps:
+      - name: Download function package
+        uses: actions/download-artifact@v4
+        with:
+          name: function-package
+
+      - name: Deploy (documented placeholder)
+        run: |
+          echo "Would deploy the release candidate to STAGING."
+          echo "Same steps as deploy-dev with environment=staging."
+          echo "Smoke test after deploy: POST /api/ClaimDailyRewardV1 twice and"
+          echo "assert rewardAmount 50 then 0 with an unchanged balance."
+
+  # -------------------------------------------------------------------------
+  # 4c. PROD - only from a v* tag on main, behind manual approval.
+  # -------------------------------------------------------------------------
+  deploy-prod:
+    name: Deploy to PROD
+    needs: [package]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: prod
+    steps:
+      - name: Download function package
+        uses: actions/download-artifact@v4
+        with:
+          name: function-package
+
+      - name: Deploy (documented placeholder)
+        run: |
+          echo "Would deploy tag ${{ github.ref_name }} to PROD after approval."
+          echo "Prefer a staging-slot deploy followed by a slot swap so rollback"
+          echo "is a swap back rather than a rebuild."
+
+  # -------------------------------------------------------------------------
+  # 5. Hotfix hygiene: remind the operator to back-merge main into develop so
+  #    the fix is not lost on the next release cut.
+  # -------------------------------------------------------------------------
+  hotfix-backmerge-reminder:
+    name: Hotfix back-merge reminder
+    needs: [build-and-test, validate-iac]
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.base_ref == 'main' &&
+      startsWith(github.head_ref, 'hotfix/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Emit back-merge checklist
+        run: |
+          {
+            echo "### Hotfix back-merge required"
+            echo ""
+            echo "After merging \`${{ github.head_ref }}\` into \`main\`:"
+            echo ""
+            echo "1. Tag \`main\` with the patched version (\`vX.Y.Z\`) to trigger the PROD deploy."
+            echo "2. Open a PR merging \`main\` back into \`develop\`."
+            echo "3. Confirm the fix is present on \`develop\` before the next release branch is cut."
+          } >> "$GITHUB_STEP_SUMMARY"
