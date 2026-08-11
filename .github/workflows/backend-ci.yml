@@ -3,9 +3,14 @@
 #
 #   feature/*  -> PR into develop : build + test + IaC validate
 #   develop    (push)             : full checks + package  -> deploy DEV
-#   release/*  -> PR into main    : full checks + package  -> deploy STAGING (gated)
-#   main       (tag v*)           : deploy PROD (manual approval via environment)
-#   hotfix/*   -> PR into main    : full checks, then back-merge to develop
+#   release/*  (push)             : full checks + package  -> deploy STAGING (gated)
+#   tag v*                        : deploy PROD (manual approval via environment)
+#   hotfix/*   -> PR into develop : full checks, then cut a patch tag
+#
+# There is deliberately no long-lived `main`. `develop` is the trunk and the
+# repository default branch; what is in production is identified by the most
+# recent `v*` tag, not by a branch pointer. Tags are immutable, so "what shipped"
+# cannot drift the way a mirror branch can.
 #
 # PR checks (build-and-test, validate-iac, package) require ZERO secrets and
 # never touch Azure. Only deploy-* jobs use a GitHub `environment:`, which is
@@ -17,13 +22,12 @@ on:
   push:
     branches:
       - develop
-      - main
+      - 'release/**'
     tags:
       - 'v*'
   pull_request:
     branches:
       - develop
-      - main
   workflow_dispatch:
 
 # Least privilege for the whole workflow. Deploy jobs opt in to `id-token: write`
@@ -136,7 +140,8 @@ jobs:
     if: >-
       github.event_name == 'push' ||
       github.event_name == 'workflow_dispatch' ||
-      github.base_ref == 'main'
+      startsWith(github.head_ref, 'release/') ||
+      startsWith(github.head_ref, 'hotfix/')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -223,16 +228,16 @@ jobs:
       #       --src GameBackend.zip
 
   # -------------------------------------------------------------------------
-  # 4b. STAGING - release/* PR into main. Environment `staging` carries a
-  #     required reviewer, so the job parks on "waiting for approval".
+  # 4b. STAGING - every push to a release/* stabilisation branch. Environment
+  #     `staging` carries a required reviewer, so the job parks on "waiting for
+  #     approval" rather than deploying unattended.
   # -------------------------------------------------------------------------
   deploy-staging:
     name: Deploy to STAGING
     needs: [package]
     if: >-
-      github.event_name == 'pull_request' &&
-      github.base_ref == 'main' &&
-      startsWith(github.head_ref, 'release/')
+      github.event_name == 'push' &&
+      startsWith(github.ref, 'refs/heads/release/')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     environment:
@@ -251,7 +256,8 @@ jobs:
           echo "assert rewardAmount 50 then 0 with an unchanged balance."
 
   # -------------------------------------------------------------------------
-  # 4c. PROD - only from a v* tag on main, behind manual approval.
+  # 4c. PROD - only from a v* tag, behind manual approval. The tag is the sole
+  #     definition of a production release; no branch pointer is involved.
   # -------------------------------------------------------------------------
   deploy-prod:
     name: Deploy to PROD
@@ -274,27 +280,30 @@ jobs:
           echo "is a swap back rather than a rebuild."
 
   # -------------------------------------------------------------------------
-  # 5. Hotfix hygiene: remind the operator to back-merge main into develop so
-  #    the fix is not lost on the next release cut.
+  # 5. Hotfix hygiene. Without a `main` mirror a hotfix lands on `develop` and
+  #    is shipped by tagging it, so the historical "back-merge or lose the fix"
+  #    trap disappears. The remaining risk is tagging the wrong commit, which is
+  #    what this checklist guards.
   # -------------------------------------------------------------------------
-  hotfix-backmerge-reminder:
-    name: Hotfix back-merge reminder
+  hotfix-release-checklist:
+    name: Hotfix release checklist
     needs: [build-and-test, validate-iac]
     if: >-
       github.event_name == 'pull_request' &&
-      github.base_ref == 'main' &&
+      github.base_ref == 'develop' &&
       startsWith(github.head_ref, 'hotfix/')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Emit back-merge checklist
+      - name: Emit release checklist
         run: |
           {
-            echo "### Hotfix back-merge required"
+            echo "### Hotfix release checklist"
             echo ""
-            echo "After merging \`${{ github.head_ref }}\` into \`main\`:"
+            echo "After merging \`${{ github.head_ref }}\` into \`develop\`:"
             echo ""
-            echo "1. Tag \`main\` with the patched version (\`vX.Y.Z\`) to trigger the PROD deploy."
-            echo "2. Open a PR merging \`main\` back into \`develop\`."
-            echo "3. Confirm the fix is present on \`develop\` before the next release branch is cut."
+            echo "1. Confirm the merge commit on \`develop\` is the exact commit you intend to ship."
+            echo "2. Tag that commit \`vX.Y.Z\` (patch bump) to trigger the gated PROD deploy."
+            echo "3. If a \`release/*\` branch is currently open, cherry-pick the fix onto it"
+            echo "   as well so the in-flight release candidate is not shipped without it."
           } >> "$GITHUB_STEP_SUMMARY"

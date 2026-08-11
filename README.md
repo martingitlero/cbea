@@ -343,15 +343,32 @@ az role assignment create \
 
 ## 5. CI/CD and deployment gating
 
-### GitFlow branching model
+### Branching model — GitFlow without a `main` mirror
+
+`develop` is the trunk and the repository default branch. There is deliberately
+**no long-lived `main`**: a release is identified by an immutable `v*` tag rather
+than by a branch pointer.
 
 | Trigger | Checks | Deploys to | Gate |
 | --- | --- | --- | --- |
 | `feature/*` → PR into `develop` | build + test + IaC validate | — | — |
 | `develop` (push/merge) | full checks + package artifact | **DEV** | none — continuous deployment |
-| `release/*` → PR into `main` | full checks + package | **STAGING** | GitHub environment `staging`, required reviewer |
-| `main` tagged `v*` | package | **PROD** | GitHub environment `prod`, **manual approval** |
-| `hotfix/*` → PR into `main` | full checks | (then tag → PROD) | approval, then **back-merge to `develop`** |
+| `release/*` (push) | full checks + package | **STAGING** | GitHub environment `staging`, required reviewer |
+| tag `v*` | package | **PROD** | GitHub environment `prod`, **manual approval** |
+| `hotfix/*` → PR into `develop` | full checks | (then tag → PROD) | approval on the `prod` environment |
+
+**Why no `main`.** In textbook GitFlow, `main` is a mirror of production and its
+only job is to answer "what is live?". A tag answers that too, and answers it
+better: tags are immutable, so the record of what shipped cannot silently drift,
+and there is no back-merge step that can be forgotten and lose a hotfix. The cost
+is that "current production" is a `git describe --tags --abbrev=0` away rather
+than a branch checkout, and rollback targets a tag instead of a branch head.
+Both are one command, so the trade favours the tag.
+
+**Release flow.** Cut `release/x.y.0` from `develop` → pushes deploy to STAGING
+behind approval → stabilise on the branch → merge back to `develop` → tag the
+merge commit `vx.y.0` to ship. Hotfixes branch from the tag being patched, land
+on `develop`, and ship as `vx.y.z`.
 
 ### Jobs
 
@@ -361,7 +378,7 @@ az role assignment create \
 | `validate-iac` | `az bicep install` → `az bicep build --file infra/main.bicep` | **No** |
 | `package` | `dotnet publish src/GameBackend/GameBackend.csproj -c Release -o ./publish` → zip → `upload-artifact@v4` | **No** |
 | `deploy-dev` / `deploy-staging` / `deploy-prod` | download artifact → deploy (documented placeholder) | Yes, via the environment |
-| `hotfix-backmerge-reminder` | Writes the back-merge checklist to the job summary | **No** |
+| `hotfix-release-checklist` | Writes the hotfix tag/cherry-pick checklist to the job summary | **No** |
 
 ### Security posture of the pipeline
 
