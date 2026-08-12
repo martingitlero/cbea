@@ -15,6 +15,12 @@
 # PR checks (build-and-test, validate-iac, package) require ZERO secrets and
 # never touch Azure. Only deploy-* jobs use a GitHub `environment:`, which is
 # where approvals and credentials are attached.
+#
+# This workflow only reacts to branch/tag pushes - it never creates or
+# retires them. That lifecycle (tag the outgoing release/* branch, delete it,
+# cut the next one) lives in the separate, manually-triggered
+# release-branch-lifecycle.yml, which is the only workflow in this repo with
+# `contents: write`.
 # ---------------------------------------------------------------------------
 name: backend-ci
 

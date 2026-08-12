@@ -1,0 +1,195 @@
+# ---------------------------------------------------------------------------
+# GameBackend - release branch lifecycle (manual, deliberate)
+#
+# Tags happen at branch-cut time, not on every merge into develop. Cutting a
+# new release/* branch is the event that retires the previous one:
+#
+#   1. Merge the outgoing release/* branch into develop (--no-ff).   <- carry-over
+#   2. Tag the resulting develop commit vX.Y.Z.                      <- ships PROD
+#   3. Delete the outgoing release/* branch.
+#   4. Cut release/<new_release_version> from develop's new tip.
+#
+# Steps 3-4 only run after 1-2 succeed (default GitHub Actions job behaviour:
+# a failing step stops the job), so a merge conflict blocks retirement and
+# deletion outright. Nothing on the outgoing branch can be lost by branch-cut
+# automation - it lands on develop before the branch is touched, and the new
+# branch is cut from that same updated develop, so it inherits it too.
+#
+# The tag this workflow pushes and the release/* branch it pushes both feed
+# the ordinary push triggers in backend-ci.yml (gated PROD and STAGING
+# deploys respectively) - this workflow does no deploying of its own.
+#
+# workflow_dispatch only, and only with a typed confirmation: this is the
+# only workflow in the repo with `contents: write`, and it deletes a branch.
+# ---------------------------------------------------------------------------
+name: release-branch-lifecycle
+
+on:
+  workflow_dispatch:
+    inputs:
+      new_release_version:
+        description: 'Version for the NEW release branch, e.g. 1.1.0 -> creates release/1.1.0'
+        required: true
+        type: string
+      retire_release_branch:
+        description: 'Branch to retire, e.g. release/1.0.0. Leave blank to auto-detect the sole existing release/* branch (fails if there is none or more than one).'
+        required: false
+        type: string
+      retire_tag_version:
+        description: 'Version to tag the retiring branch with, e.g. 1.0.0 -> creates tag v1.0.0. Required only if a branch is being retired.'
+        required: false
+        type: string
+      confirm:
+        description: 'Type exactly: retire-and-cut'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-branch-lifecycle
+  cancel-in-progress: false
+
+jobs:
+  cut:
+    name: Retire previous release branch and cut the next
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Validate confirmation
+        run: |
+          if [ "${{ inputs.confirm }}" != "retire-and-cut" ]; then
+            echo "::error::confirm must be exactly 'retire-and-cut'. Got: '${{ inputs.confirm }}'"
+            exit 1
+          fi
+
+      - name: Validate inputs
+        run: |
+          ver_re='^[0-9]+\.[0-9]+\.[0-9]+$'
+          [[ "${{ inputs.new_release_version }}" =~ $ver_re ]] \
+            || { echo "::error::new_release_version must look like 1.2.3"; exit 1; }
+
+          retire_branch="${{ inputs.retire_release_branch }}"
+          if [ -n "$retire_branch" ] && [[ "$retire_branch" != release/* ]]; then
+            echo "::error::retire_release_branch must start with 'release/' (got '$retire_branch'). Refusing to retire an unrelated branch."
+            exit 1
+          fi
+
+          if [ -n "${{ inputs.retire_tag_version }}" ]; then
+            [[ "${{ inputs.retire_tag_version }}" =~ $ver_re ]] \
+              || { echo "::error::retire_tag_version must look like 1.2.3"; exit 1; }
+          fi
+
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: develop
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Detect release branch to retire
+        id: detect
+        run: |
+          explicit="${{ inputs.retire_release_branch }}"
+          if [ -n "$explicit" ]; then
+            branch="$explicit"
+            if ! git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+              echo "::error::Branch '$branch' does not exist on origin."
+              exit 1
+            fi
+          else
+            mapfile -t candidates < <(git ls-remote --heads origin 'release/*' | sed -E 's#.*refs/heads/##')
+            if [ "${#candidates[@]}" -eq 0 ]; then
+              echo "No existing release/* branch found - nothing to retire (this is the first cut)."
+              branch=""
+            elif [ "${#candidates[@]}" -gt 1 ]; then
+              echo "::error::Multiple release/* branches exist (${candidates[*]}). Re-run with retire_release_branch set explicitly."
+              exit 1
+            else
+              branch="${candidates[0]}"
+            fi
+          fi
+
+          if [ -n "$branch" ] && [ -z "${{ inputs.retire_tag_version }}" ]; then
+            echo "::error::Retiring '$branch' but retire_tag_version was not provided."
+            exit 1
+          fi
+
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          [ -n "$branch" ] && echo "should_retire=true" >> "$GITHUB_OUTPUT" \
+                            || echo "should_retire=false" >> "$GITHUB_OUTPUT"
+
+      - name: Guard against ref name collisions
+        run: |
+          new_branch="release/${{ inputs.new_release_version }}"
+          new_branch_tag="v${{ inputs.new_release_version }}"
+          if git ls-remote --exit-code --heads origin "$new_branch" >/dev/null 2>&1; then
+            echo "::error::Branch '$new_branch' already exists."; exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "$new_branch_tag" >/dev/null 2>&1; then
+            echo "::error::Tag '$new_branch_tag' already exists."; exit 1
+          fi
+          if [ -n "${{ inputs.retire_tag_version }}" ]; then
+            retire_tag="v${{ inputs.retire_tag_version }}"
+            if git ls-remote --exit-code --tags origin "$retire_tag" >/dev/null 2>&1; then
+              echo "::error::Tag '$retire_tag' already exists."; exit 1
+            fi
+          fi
+
+      # --- Carry-over. Must succeed before anything is tagged or deleted.
+      - name: Merge outgoing release branch into develop
+        if: steps.detect.outputs.should_retire == 'true'
+        run: |
+          branch="${{ steps.detect.outputs.branch }}"
+          git fetch origin "$branch"
+          git checkout develop
+          git merge --no-ff "origin/$branch" \
+            -m "Merge $branch into develop (release cut: retiring for v${{ inputs.retire_tag_version }})"
+
+      - name: Push develop
+        if: steps.detect.outputs.should_retire == 'true'
+        run: git push origin develop
+
+      - name: Tag the retiring release
+        if: steps.detect.outputs.should_retire == 'true'
+        run: |
+          tag="v${{ inputs.retire_tag_version }}"
+          git tag -a "$tag" -m "Release $tag (branch ${{ steps.detect.outputs.branch }}, retired at branch cut)"
+          git push origin "$tag"
+
+      - name: Delete the retired branch
+        if: steps.detect.outputs.should_retire == 'true'
+        run: git push origin --delete "${{ steps.detect.outputs.branch }}"
+
+      # --- Cut the new branch from develop's current tip, which already
+      #     includes the carried-over changes when a retirement happened above.
+      - name: Sync local develop
+        run: |
+          git checkout develop
+          git pull --ff-only origin develop
+
+      - name: Cut new release branch
+        run: |
+          new_branch="release/${{ inputs.new_release_version }}"
+          git checkout -b "$new_branch"
+          git push origin "$new_branch"
+
+      - name: Summary
+        run: |
+          {
+            echo "### Release branch cut"
+            echo ""
+            if [ "${{ steps.detect.outputs.should_retire }}" == "true" ]; then
+              echo "- Retired \`${{ steps.detect.outputs.branch }}\`: merged into \`develop\`, tagged \`v${{ inputs.retire_tag_version }}\`, branch deleted."
+              echo "- Tag \`v${{ inputs.retire_tag_version }}\` triggers the gated PROD deploy in \`backend-ci.yml\`."
+            else
+              echo "- No existing release/* branch found; this was the first release cut."
+            fi
+            echo "- Cut \`release/${{ inputs.new_release_version }}\` from \`develop\`."
+            echo "- That push triggers the gated STAGING deploy in \`backend-ci.yml\`."
+          } >> "$GITHUB_STEP_SUMMARY"

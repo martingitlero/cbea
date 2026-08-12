@@ -366,11 +366,55 @@ than a branch checkout, and rollback targets a tag instead of a branch head.
 Both are one command, so the trade favours the tag.
 
 **Release flow.** Cut `release/x.y.0` from `develop` → pushes deploy to STAGING
-behind approval → stabilise on the branch → merge back to `develop` → tag the
-merge commit `vx.y.0` to ship. Hotfixes branch from the tag being patched, land
-on `develop`, and ship as `vx.y.z`.
+behind approval → stabilise on the branch → the *next* branch cut retires it:
+merges it into `develop`, tags that merge commit `vx.y.0` to ship, deletes it,
+and cuts `release/x.y+1.0` in the same operation. Hotfixes are the exception —
+see below.
 
-### Jobs
+### Tagging cadence: at branch cut, not on every merge
+
+Tags mark a release, not a commit into `develop`, so they are created only when
+a release/* branch is retired — never as a side effect of an ordinary merge.
+That retirement is automated by a second, separate workflow:
+[`release-branch-lifecycle.yml`](.github/workflows/release-branch-lifecycle.yml),
+triggered manually (`workflow_dispatch`) with four inputs:
+
+| Input | Required | Example | Meaning |
+| --- | --- | --- | --- |
+| `new_release_version` | yes | `1.1.0` | Creates `release/1.1.0` |
+| `retire_release_branch` | no | `release/1.0.0` | Branch to retire; auto-detected if blank (fails if zero or more than one `release/*` branch exists — ambiguity is never guessed) |
+| `retire_tag_version` | only if retiring | `1.0.0` | Creates tag `v1.0.0` on the outgoing branch |
+| `confirm` | yes | `retire-and-cut` | Must match exactly — this merges, tags, and deletes a branch |
+
+It runs as one strict sequence, and **a failure at any step stops the rest**:
+
+1. **Merge** the outgoing `release/*` branch into `develop` (`--no-ff`). This is
+   the carry-over guarantee: if this step fails (a real merge conflict), the
+   job stops here — nothing is tagged, nothing is deleted, and the outgoing
+   branch is untouched. A conflict has to be resolved by hand (a normal PR
+   into `develop`) and the workflow re-run.
+2. **Push** `develop`, now containing everything from the outgoing branch.
+3. **Tag** that merge commit `vX.Y.Z` — this push is what triggers the gated
+   PROD deploy in `backend-ci.yml`.
+4. **Delete** the outgoing `release/*` branch — only now, after 1–3 succeeded.
+5. **Cut** the new `release/<new_release_version>` branch from `develop`'s
+   current tip, so it starts from a state that already includes everything
+   carried over in step 1. Pushing it triggers the gated STAGING deploy.
+
+This is the only workflow in the repository with `contents: write` —
+`backend-ci.yml` stays read-only — and it is `workflow_dispatch`-only with a
+typed confirmation string, since it deletes a branch. First-ever cut (no
+`release/*` branch exists yet) is handled: steps 1–4 are skipped and it goes
+straight to cutting the first branch.
+
+**Hotfixes are the deliberate exception.** They don't wait for a scheduled
+branch cut — after `hotfix/*` merges into `develop`, a maintainer tags that
+commit directly (`git tag vX.Y.Z && git push origin vX.Y.Z`), per the
+checklist the `hotfix-release-checklist` job prints. Urgency justifies
+bypassing the lifecycle workflow; the next scheduled branch cut still finds
+`develop` in the right state either way.
+
+### Jobs — `backend-ci.yml` (reacts to pushes/tags; `contents: read`)
 
 | Job | Does | Needs secrets |
 | --- | --- | --- |
@@ -378,6 +422,12 @@ on `develop`, and ship as `vx.y.z`.
 | `validate-iac` | `az bicep install` → `az bicep build --file infra/main.bicep` | **No** |
 | `package` | `dotnet publish src/GameBackend/GameBackend.csproj -c Release -o ./publish` → zip → `upload-artifact@v4` | **No** |
 | `deploy-dev` / `deploy-staging` / `deploy-prod` | download artifact → deploy (documented placeholder) | Yes, via the environment |
+
+### Job — `release-branch-lifecycle.yml` (manual only; `contents: write`)
+
+| Job | Does | Needs secrets |
+| --- | --- | --- |
+| `cut` | Validates inputs → merges the outgoing `release/*` branch into `develop` → tags it → deletes it → cuts the next `release/*` branch | **No** — pushes with the workflow's own `GITHUB_TOKEN`, no Azure credentials involved |
 | `hotfix-release-checklist` | Writes the hotfix tag/cherry-pick checklist to the job summary | **No** |
 
 ### Security posture of the pipeline
