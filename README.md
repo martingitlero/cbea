@@ -17,8 +17,10 @@ A player calls `ClaimDailyRewardV1` through PlayFab CloudScript and receives **5
 ```
 GameBackend.sln
 ├─ src/GameBackend/                 function app (ClaimDailyRewardV1, models, DI wiring)
+│  └─ GameBackend.http              the six demo calls, for editors that run .http files
 ├─ tests/GameBackend.Tests/         xUnit tests
 ├─ infra/main.bicep                 storage, plan, function app, app insights, MI
+├─ samples/                         request payloads for the curl walkthrough (section 1)
 └─ .github/workflows/
    ├─ backend-ci.yml                build / test / package the .NET project
    └─ infra-ci.yml                  compile + lint the Bicep template
