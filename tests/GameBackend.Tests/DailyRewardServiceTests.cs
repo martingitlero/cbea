@@ -145,6 +145,34 @@ public sealed class DailyRewardServiceTests
     }
 
     [Fact]
+    public async Task ClaimAsync_RotatedClientRequestId_DoesNotGrantTwice()
+    {
+        // Arrange — the brief's rule stated as an attack: clientRequestId "must not be the only
+        // protection against duplicate grants", so rotating it must not buy a second reward.
+        var clock = new FakeClock(FixedInstant);
+        var stateStore = new RecordingStateStore();
+        var wallet = new RecordingWallet(StartingBalance);
+        var service = CreateService(clock, stateStore, wallet);
+
+        // Act — same player, same UTC day, deliberately different client request ids.
+        var first = await service.ClaimAsync(CreateRequest(clientRequestId: "trace-aaa"));
+        var second = await service.ClaimAsync(CreateRequest(clientRequestId: "trace-bbb"));
+
+        // Assert
+        Assert.True(first.NewlyClaimed);
+        Assert.Equal(RewardAmount, first.RewardAmount);
+
+        Assert.True(second.AlreadyClaimed);
+        Assert.False(second.NewlyClaimed);
+        Assert.True(second.Success);
+        Assert.Null(second.ErrorCode);
+        Assert.Equal(0, second.RewardAmount);
+
+        Assert.Equal(1, wallet.AddCallCount);
+        Assert.Equal(StartingBalance + RewardAmount, second.Balance);
+    }
+
+    [Fact]
     public async Task ClaimAsync_UnknownQuestId_ReturnsUnknownQuestAndTouchesNeitherWalletNorStateStore()
     {
         // Arrange
@@ -363,7 +391,7 @@ public sealed class DailyRewardServiceTests
         ISystemClock clock,
         IDailyRewardStateStore stateStore,
         ICurrencyWallet wallet)
-        => new(clock, stateStore, wallet, NullLogger<DailyRewardService>.Instance);
+        => new(clock, stateStore, wallet, NullLogger<DailyRewardService>.Instance, new DailyRewardOptions());
 
     private static PlayFabExecuteFunctionRequest CreateRequest(
         string? questId = QuestId,
@@ -381,11 +409,6 @@ public sealed class DailyRewardServiceTests
             CallerEntityProfile = new CallerEntityProfile
             {
                 Entity = new CallerEntity { Id = entityId, Type = entityType },
-            },
-            TitleAuthenticationContext = new TitleAuthenticationContext
-            {
-                Id = "TITLE1",
-                EntityToken = "entity-token",
             },
         };
 

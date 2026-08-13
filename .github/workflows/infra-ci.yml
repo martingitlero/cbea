@@ -1,0 +1,48 @@
+# Infrastructure CI — the Bicep template. Paired with backend-ci.yml (the .NET project).
+# Offline only: no login, no subscription, no credential. README section 5 covers why the
+# workflows are split, why there is no `paths:` filter, and what `bicep build` does not prove.
+name: infra-ci
+
+on:
+  push:
+    branches:
+      - develop
+      - 'release/**'
+  pull_request:
+    branches:
+      - develop
+      - 'release/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: infra-ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  BICEP_TEMPLATE: infra/main.bicep
+
+jobs:
+  validate-bicep:
+    name: Validate Bicep
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # az is preinstalled on GitHub-hosted runners; this pulls the Bicep CLI.
+      - name: Install Bicep CLI
+        run: |
+          az bicep install
+          az bicep version
+
+      # Compile to ARM JSON. stdout is discarded — the exit code is the signal.
+      - name: Build template
+        run: az bicep build --file ${{ env.BICEP_TEMPLATE }} --stdout > /dev/null
+
+      # Separate step so a lint failure is distinguishable from a compile failure at a glance.
+      - name: Lint template
+        run: az bicep lint --file ${{ env.BICEP_TEMPLATE }}

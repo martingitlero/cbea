@@ -485,3 +485,10 @@ $RECYCLE.BIN/
 
 # Local agent/editor tooling config — not part of the submission
 .claude/
+CLAUDE.md
+
+# Working notes and manual test runbooks — not part of the graded submission
+docs/
+
+# Compiled ARM output from `az bicep build` (regenerate, never commit)
+infra/*.json

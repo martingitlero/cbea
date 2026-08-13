@@ -7,17 +7,11 @@ namespace GameBackend.Services;
 /// Grants a fixed, server-owned daily reward at most once per player per UTC day.
 /// </summary>
 /// <remarks>
-/// <para><b>Trust boundary.</b> This function sits behind PlayFab
-/// <c>ExecuteFunction</c>. Everything under <see cref="FunctionArgument"/> is
-/// authored by the game client and is therefore untrusted. The only identity
-/// this service will act on is <c>CallerEntityProfile.Entity</c>, which PlayFab
-/// attaches server-side. <see cref="FunctionArgument.ClientPlayerId"/> is never
-/// read; honouring it would let any client claim another player's reward.</para>
-/// <para><b>Idempotency.</b> The dedup key is derived entirely from trusted
-/// values — quest id, the PlayFab entity id, and the <em>server</em> UTC date.
-/// <see cref="FunctionArgument.ClientRequestId"/> is logged for tracing only:
-/// a client that varies it must not be able to claim twice, and a client that
-/// repeats it must not be able to suppress another player's grant.</para>
+/// <b>Trust boundary.</b> Everything under <see cref="FunctionArgument"/> is authored by the game
+/// client and untrusted; the only identity acted on is <c>CallerEntityProfile.Entity</c>, which
+/// PlayFab attaches server-side. The dedup key is built from trusted values only — quest id, that
+/// entity id, and the <em>server</em> UTC date — so a client cannot claim twice by varying
+/// <see cref="FunctionArgument.ClientRequestId"/>, which is logged for tracing and nothing else.
 /// </remarks>
 public sealed class DailyRewardService : IDailyRewardService
 {
@@ -32,25 +26,25 @@ public sealed class DailyRewardService : IDailyRewardService
         IDailyRewardStateStore stateStore,
         ICurrencyWallet wallet,
         ILogger<DailyRewardService> logger,
-        DailyRewardOptions? options = null)
+        DailyRewardOptions options)
     {
         _clock = clock ?? throw new ArgumentNullException(nameof(clock));
         _stateStore = stateStore ?? throw new ArgumentNullException(nameof(stateStore));
         _wallet = wallet ?? throw new ArgumentNullException(nameof(wallet));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
-        _options = options ?? new DailyRewardOptions();
+        _options = options ?? throw new ArgumentNullException(nameof(options));
     }
 
     public async Task<ClaimDailyRewardResponse> ClaimAsync(
         PlayFabExecuteFunctionRequest? request,
         CancellationToken cancellationToken = default)
     {
-        // Server UTC date only. Client local time is untrusted and would let a
-        // player farm the reward by changing their device clock or timezone.
+        // Server UTC date only — client local time would let a player farm the reward by changing
+        // their device clock. ToUniversalTime normalises the offset so the date is UTC's, whatever
+        // offset the clock implementation hands back.
         var now = _clock.UtcNow.ToUniversalTime();
         var claimDateUtc = now.ToString("yyyy-MM-dd");
 
-        // (1) Shape validation.
         var argument = request?.FunctionArgument;
         if (argument is null || string.IsNullOrWhiteSpace(argument.QuestId))
         {
@@ -62,7 +56,7 @@ public sealed class DailyRewardService : IDailyRewardService
 
         var questId = argument.QuestId;
 
-        // (2) Caller identity — the only field we are willing to act on.
+        // Caller identity — the only field we are willing to act on.
         var entity = request?.CallerEntityProfile?.Entity;
         if (entity is null
             || string.IsNullOrWhiteSpace(entity.Id)
@@ -77,8 +71,8 @@ public sealed class DailyRewardService : IDailyRewardService
 
         var playerEntityId = entity.Id;
 
-        // (3) Quest allow-list. Rejected before touching any dependency so an
-        // unknown quest can never mutate wallet or state.
+        // Quest allow-list, checked before any dependency is touched so an unknown quest can never
+        // mutate wallet or state.
         if (!string.Equals(questId, _options.QuestId, StringComparison.Ordinal))
         {
             _logger.LogWarning(
@@ -96,17 +90,19 @@ public sealed class DailyRewardService : IDailyRewardService
             if (await _stateStore.HasClaimedAsync(idempotencyKey, cancellationToken)
                 .ConfigureAwait(false))
             {
-                // Duplicate same-day claim is a success, not an error: the client
-                // retried and the server-side outcome is already what it wanted.
-                // Amount is zero but the balance reported is the player's real
-                // current balance, so the client can reconcile its local state.
+                // A duplicate is a success, not an error — the outcome is already what the caller
+                // wanted. Amount is zero, but the balance returned is real so the client can
+                // reconcile.
                 var currentBalance = await _wallet
                     .GetBalanceAsync(playerEntityId, _options.CurrencyId, cancellationToken)
                     .ConfigureAwait(false);
 
                 _logger.LogInformation(
-                    "Duplicate claim for {PlayerEntityId} on {ClaimDateUtc} (trace {ClientRequestId}); no grant.",
-                    playerEntityId, claimDateUtc, argument.ClientRequestId);
+                    "Daily reward claim rejected as duplicate for {PlayerEntityId} on {ClaimDateUtc}: "
+                    + "quest {QuestId}, key {IdempotencyKey}, alreadyClaimed {AlreadyClaimed}, "
+                    + "rewardAmount {RewardAmount}, trace {ClientRequestId}.",
+                    playerEntityId, claimDateUtc, questId, idempotencyKey, true, 0,
+                    argument.ClientRequestId);
 
                 return new ClaimDailyRewardResponse
                 {
@@ -122,16 +118,12 @@ public sealed class DailyRewardService : IDailyRewardService
                 };
             }
 
-            // Reserve before granting. If the process dies between these two
-            // awaits the player loses one day's reward (recoverable by support)
-            // rather than being granted twice (an unrecoverable economy exploit).
+            // Reserve before granting: a crash between these awaits costs the player one day's
+            // reward (recoverable) rather than granting twice (an economy exploit that is not).
             //
-            // KNOWN LIMITATION: HasClaimedAsync + RecordClaimAsync is a
-            // read-then-write race — two concurrent requests can both observe
-            // "not claimed". The in-memory fake makes this invisible. A durable
-            // implementation must collapse these into one atomic conditional
-            // write (Cosmos unique key / Table Storage insert-if-not-exists /
-            // ETag precondition) and treat a conflict as the already-claimed path.
+            // KNOWN LIMITATION: read-then-write race — two concurrent requests can both observe
+            // "not claimed". Fix is to collapse these two calls into one atomic conditional write.
+            // See README section 3.
             await _stateStore.RecordClaimAsync(idempotencyKey, now, cancellationToken)
                 .ConfigureAwait(false);
 
@@ -140,8 +132,11 @@ public sealed class DailyRewardService : IDailyRewardService
                 .ConfigureAwait(false);
 
             _logger.LogInformation(
-                "Granted {Amount} {CurrencyId} to {PlayerEntityId} for {ClaimDateUtc} (trace {ClientRequestId}).",
-                _options.Amount, _options.CurrencyId, playerEntityId, claimDateUtc, argument.ClientRequestId);
+                "Daily reward granted to {PlayerEntityId} on {ClaimDateUtc}: quest {QuestId}, "
+                + "key {IdempotencyKey}, alreadyClaimed {AlreadyClaimed}, "
+                + "rewardAmount {RewardAmount} {CurrencyId}, trace {ClientRequestId}.",
+                playerEntityId, claimDateUtc, questId, idempotencyKey, false, _options.Amount,
+                _options.CurrencyId, argument.ClientRequestId);
 
             return new ClaimDailyRewardResponse
             {

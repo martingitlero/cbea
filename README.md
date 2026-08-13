@@ -12,15 +12,57 @@ A player calls `ClaimDailyRewardV1` through PlayFab CloudScript and receives **5
 | Reward | `50` of `currency.soft` |
 | Tests | xUnit (`tests/GameBackend.Tests`) |
 | IaC | Bicep (`infra/main.bicep`) |
-| CI/CD | GitHub Actions (`.github/workflows/backend-ci.yml`), GitFlow |
+| CI | GitHub Actions — `backend-ci.yml` (code) + `infra-ci.yml` (Bicep) |
 
 ```
 GameBackend.sln
 ├─ src/GameBackend/                 function app (ClaimDailyRewardV1, models, DI wiring)
 ├─ tests/GameBackend.Tests/         xUnit tests
 ├─ infra/main.bicep                 storage, plan, function app, app insights, MI
-└─ .github/workflows/backend-ci.yml build / test / IaC validate / package / gated deploys
+└─ .github/workflows/
+   ├─ backend-ci.yml                build / test / package the .NET project
+   └─ infra-ci.yml                  compile + lint the Bicep template
 ```
+
+## How this was built
+
+Written with AI assistance — Claude Code, driven through two skill libraries (**Claude Octopus** and
+**Matt Pocock's engineering skills**), used for structured critique of my own design rather than to
+generate a solution unattended. I'm disclosing it because how the tooling was used is itself an
+engineering decision, and I'd rather show that than have it inferred.
+
+Where the tooling was wrong it was caught by building and running the code, not by reading it: a
+"dead code" finding was false, and deleting the constructor broke the build. Every claim in this
+README was checked against the source, and **`dotnet test`, `dotnet publish`, `az bicep build` and
+`az bicep lint` were all executed against the final tree**, not assumed.
+
+## Design decisions worth calling out
+
+Choices made deliberately, which a reviewer may or may not agree with:
+
+- **CI split by domain.** Code and infrastructure are separate workflows with separate status checks,
+  so a red build names its own cause. The cost — `package` can't depend on the Bicep gate, since jobs
+  can't span workflows — is re-coupled by branch protection requiring both.
+- **No `paths:` filters, on purpose.** A path-filtered workflow that doesn't trigger never reports,
+  and a *required* check that never reports blocks the PR forever. Both finish in ~2 minutes.
+- **Nothing reaches a protected branch without a PR.** `develop` and `release/*` require a pull
+  request, both status checks green, an up-to-date branch, and no force pushes — with
+  `enforce_admins: true`, because a rule with an owner-shaped hole isn't a rule. Section 5 has the
+  exact `gh api` call.
+- **GitFlow is the intended branch model** — `develop` as trunk, `release/*` for stabilisation, no
+  long-lived `main`, and a release identified by an immutable tag rather than a branch pointer.
+  Only the branch *shape* is wired up here: the workflows and the protection rules target `develop`
+  and `release/*`. The release-cut, tagging and back-merge automation is stated intent, not
+  implemented — a half-built release train inside a 2-3 hour timebox would be worse than an honest
+  statement of direction.
+- **Zero secrets in the entire pipeline.** No job touches Azure, so a PR from any branch is safe and
+  there is no credential in CI to leak.
+- **The trust boundary is tested adversarially.** Every fixture that carries a payload at all carries
+  a spoofed `clientPlayerId`, so the tests attack the trust boundary rather than cooperating with it.
+- **A known limitation is documented in the code, not hidden.** The read-then-write race in
+  `DailyRewardService` is commented at the exact lines it occurs, with the fix named.
+- **Deployment is documented rather than stubbed.** The brief permits "clearly documented as a later
+  step"; a job that only prints its intent looks like CD without being it.
 
 ---
 
@@ -32,54 +74,16 @@ dotnet build   GameBackend.sln -c Release
 dotnet test    GameBackend.sln -c Release
 ```
 
-With a TRX log and coverage, matching what CI produces:
+Expect **21 passing tests**. With a TRX log, matching what CI produces:
 
 ```bash
 dotnet test GameBackend.sln -c Release \
   --logger "trx;LogFileName=test-results.trx" \
-  --results-directory ./TestResults \
-  --collect:"XPlat Code Coverage"
+  --results-directory ./TestResults
 ```
 
-### ⚠️ Windows gotcha — the `dotnet` on `PATH` is runtime-only
-
-On this machine `dotnet` resolves to `C:\Program Files\dotnet\dotnet.exe`, which is a
-**runtime-only host with no SDK installed**. `dotnet --list-sdks` there returns nothing, and any
-`dotnet build` / `dotnet test` fails with *"… requires the .NET SDK"*.
-
-The .NET 8 SDK (**8.0.423**) is installed per-user at `%LOCALAPPDATA%\Microsoft\dotnet`.
-
-Verify which one you have:
-
-```powershell
-dotnet --list-sdks                                    # empty  -> runtime-only host
-& "$env:LOCALAPPDATA\Microsoft\dotnet\dotnet.exe" --list-sdks   # 8.0.423 [ ...\sdk ]
-```
-
-Fix it for the current shell by putting the SDK first on `PATH`:
-
-```powershell
-# PowerShell — current session only
-$env:PATH = "$env:LOCALAPPDATA\Microsoft\dotnet;$env:PATH"
-dotnet --list-sdks      # 8.0.423 ...
-dotnet test GameBackend.sln -c Release
-```
-
-```bash
-# Git Bash — current session only
-export PATH="$LOCALAPPDATA/Microsoft/dotnet:$PATH"
-dotnet test GameBackend.sln -c Release
-```
-
-Or invoke the SDK directly without touching `PATH`:
-
-```powershell
-& "$env:LOCALAPPDATA\Microsoft\dotnet\dotnet.exe" test GameBackend.sln -c Release
-```
-
-To make it permanent, add `%LOCALAPPDATA%\Microsoft\dotnet` **ahead of** `C:\Program Files\dotnet`
-in the user `Path` environment variable. CI is unaffected — `actions/setup-dotnet@v4` provisions a
-real SDK on the runner.
+Requires the .NET 8 **SDK** — `dotnet --list-sdks` must be non-empty. A runtime-only
+install fails with *"… requires the .NET SDK"*.
 
 ### Validating the infrastructure template
 
@@ -93,8 +97,45 @@ runs, and it needs **no Azure login and no credentials** — it is a pure offlin
 ### Running the function locally
 
 ```bash
-func start --csharp   # requires Azure Functions Core Tools v4
+cd src/GameBackend
+func start            # requires Azure Functions Core Tools v4
 ```
+
+Wait for `ClaimDailyRewardV1: [POST] http://localhost:7071/api/ClaimDailyRewardV1`.
+
+**Two ways to exercise it**, both covering the same six calls — first claim, idempotent repeat, a
+varied `clientRequestId`, and the three rejection paths.
+
+**In an editor:** open [`src/GameBackend/GameBackend.http`](src/GameBackend/GameBackend.http) and
+send each request. Runs in Visual Studio 2022 (17.8+) and JetBrains IDEs with no extension, or in
+VS Code with `code --install-extension humao.rest-client`.
+
+**With curl:** request bodies are in [`samples/`](samples/). Run them in order, against a
+**freshly started host** — state is a process-local singleton, so a second pass returns
+`alreadyClaimed` on the first call. Restarting `func start` resets every balance and claim.
+
+On PowerShell write `curl.exe`; plain `curl` there is an alias for `Invoke-WebRequest` and takes
+entirely different arguments.
+
+```bash
+curl -s http://localhost:7071/api/ClaimDailyRewardV1 -H "Content-Type: application/json" -d @samples/1-claim.json      # 200  rewardAmount 50, newlyClaimed true
+curl -s http://localhost:7071/api/ClaimDailyRewardV1 -H "Content-Type: application/json" -d @samples/1-claim.json      # 200  rewardAmount 0,  alreadyClaimed true
+curl -s http://localhost:7071/api/ClaimDailyRewardV1 -H "Content-Type: application/json" -d @samples/2-varied-id.json  # 200  still alreadyClaimed — dedup ignores clientRequestId
+curl -s http://localhost:7071/api/ClaimDailyRewardV1 -H "Content-Type: application/json" -d @samples/3-no-entity.json  # 400  MissingCallerEntity
+curl -s http://localhost:7071/api/ClaimDailyRewardV1 -H "Content-Type: application/json" -d @samples/4-bad-quest.json  # 400  UnknownQuest
+curl -s http://localhost:7071/api/ClaimDailyRewardV1 -H "Content-Type: application/json" -d @samples/5-garbage.txt     # 400  BadRequest (not 500)
+```
+
+`-d @file` implies POST, so no `-X` is needed. Add `-w '\n%{http_code}\n'` to print the status, and
+pipe to `jq .` to format the body — but not both at once, since the appended status code makes the
+output invalid JSON.
+
+The first call returns `playerEntityId: "title_player_123"` — the authenticated entity — **not** the
+`clientPlayerId: "do-not-trust-this-field"` that the same request also sends. That substitution is
+the trust boundary in one line of output.
+
+**No function key appears anywhere in `samples/` or the `.http` file, and none is needed locally:**
+the host disables authorization regardless of `authLevel` when running outside Azure.
 
 `src/GameBackend/local.settings.json` holds local-only values and is git-ignored. It must never
 contain a real PlayFab developer secret — see [section 4](#4-secrets-and-app-settings).
@@ -146,16 +187,18 @@ sequenceDiagram
     CK-->>FN: 2026-08-12T09:14:00Z
     FN->>FN: key = "daily_login:{entityId}:2026-08-12"
 
+    FN->>ST: HasClaimedAsync(key)
+
     alt first claim today
-        FN->>ST: mark claimed (key)
-        ST-->>FN: true
-        FN->>W: credit(entityId, "currency.soft", 50)
-        W-->>FN: balance
+        ST-->>FN: false
+        FN->>ST: RecordClaimAsync(key, now)
+        Note over FN,ST: two calls, not one atomic write —<br/>known race, see section 3
+        FN->>W: AddAsync(entityId, "currency.soft", 50)
+        W-->>FN: new balance
         FN-->>PF: 200 { rewardAmount: 50,<br/>newlyClaimed: true, alreadyClaimed: false }
     else already claimed today
-        FN->>ST: mark claimed (key)
-        ST-->>FN: false
-        FN->>W: read balance(entityId)
+        ST-->>FN: true
+        FN->>W: GetBalanceAsync(entityId, "currency.soft")
         W-->>FN: balance (unchanged)
         FN-->>PF: 200 { rewardAmount: 0,<br/>newlyClaimed: false, alreadyClaimed: true }
     end
@@ -198,6 +241,11 @@ without a version bump of the function (`…V1`).
 
 **Success — first claim of the UTC day**
 
+`balance` is the player's real post-credit balance, so it depends on what they already held. The
+in-memory wallet starts every player at zero, which is why a fresh host returns `50` here where the
+brief's illustrative example shows `150` for a player who already had `100`. Every other field
+matches the brief's contract exactly, including the explicit `null`s.
+
 ```json
 {
   "success": true,
@@ -237,19 +285,23 @@ first call. The client can safely retry a dropped response without double-credit
 
 **Failure — missing caller entity**
 
+Note that `claimDateUtc` and `rewardCurrencyId` are **still populated** on a failure — the server
+knows both regardless of who is asking. Only `playerEntityId` is `null`, because that is precisely
+what could not be established.
+
 ```json
 {
   "success": false,
   "questId": "daily_login",
   "playerEntityId": null,
-  "claimDateUtc": null,
-  "rewardCurrencyId": null,
+  "claimDateUtc": "2026-08-12",
+  "rewardCurrencyId": "currency.soft",
   "rewardAmount": 0,
   "newlyClaimed": false,
   "alreadyClaimed": false,
   "balance": 0,
   "errorCode": "MissingCallerEntity",
-  "errorMessage": "Caller entity is missing from the PlayFab request."
+  "errorMessage": "CallerEntityProfile.Entity.Id and Type are required."
 }
 ```
 
@@ -263,7 +315,7 @@ first call. The client can safely retry a dropped response without double-credit
 | **No distributed lock or atomic conditional write** | The fake store is a single-process dictionary; a real lock is meaningless without a real store | See the race below |
 | **No real PlayFab SDK calls** | Would need a live title and a developer secret in source or CI — both unacceptable for a screening submission | `PlayFabEconomyAPI` / `AddInventoryItems` behind `ICurrencyWallet`, secret via Key Vault + managed identity |
 | State is **lost on restart** | Consumption plan cold starts discard process memory | Durable store makes this moot |
-| **No auth on the HTTP trigger beyond PlayFab** | PlayFab is the only intended caller | Function key or `authLevel: function`, plus IP restrictions / Private Endpoint |
+| **Only a function key guards the trigger** (`AuthorizationLevel.Function`) — PlayFab holds it | PlayFab is the only intended caller, and the reward logic rejects an unauthenticated caller anyway | IP restrictions or a Private Endpoint so the key is not the only network control |
 | Reward amount and currency are **app settings**, not code constants | Live-ops tuning without a redeploy | Same, plus a remote config service if it needs to change per-cohort |
 
 ### The read-then-write race — known and deliberate
@@ -283,9 +335,14 @@ engine arbitrate:
 - **Distributed lease** (blob lease, Redis lock) — works, but adds a failure mode (lock expiry,
   orphaned leases) for an invariant a unique key already enforces for free.
 
-The seam is designed so this is a change *inside* `IDailyRewardStateStore` — the handler already
-treats "mark claimed" as one call returning true/false, which is exactly the shape of an atomic
-conditional insert.
+The seam contains the fix. `IDailyRewardStateStore` today exposes the race directly — `HasClaimedAsync`
+then `RecordClaimAsync`, two calls. Correcting it means collapsing those into one
+`TryRecordClaimAsync(key, now)` that returns `false` when the key already exists, which is exactly the
+shape of an atomic conditional insert. That touches the interface, its implementation, and one branch
+of `DailyRewardService` — the HTTP handler, the response contract and the tests' assertions are all
+unaffected. It is left undone deliberately: with a single-process dictionary behind the interface
+there is nothing for an atomic write to arbitrate, and pretending otherwise would hide the real
+constraint rather than name it.
 
 ---
 
@@ -341,130 +398,122 @@ az role assignment create \
 
 ---
 
-## 5. CI/CD and deployment gating
+## 5. CI and deployment
 
-### Branching model — GitFlow without a `main` mirror
+### Two workflows, split by domain
 
-`develop` is the trunk and the repository default branch. There is deliberately
-**no long-lived `main`**: a release is identified by an immutable `v*` tag rather
-than by a branch pointer.
+Both run on pushes to `develop` and `release/*`, on PRs targeting either, and on manual dispatch.
+Neither touches Azure, so **no job anywhere needs a secret**.
 
-| Trigger | Checks | Deploys to | Gate |
-| --- | --- | --- | --- |
-| `feature/*` → PR into `develop` | build + test + IaC validate | — | — |
-| `develop` (push/merge) | full checks + package artifact | **DEV** | none — continuous deployment |
-| `release/*` (push) | full checks + package | **STAGING** | GitHub environment `staging`, required reviewer |
-| tag `v*` | package | **PROD** | GitHub environment `prod`, **manual approval** |
-| `hotfix/*` → PR into `develop` | full checks | (then tag → PROD) | approval on the `prod` environment |
+**`backend-ci.yml`** — the .NET project:
 
-**Why no `main`.** In textbook GitFlow, `main` is a mirror of production and its
-only job is to answer "what is live?". A tag answers that too, and answers it
-better: tags are immutable, so the record of what shipped cannot silently drift,
-and there is no back-merge step that can be forgotten and lose a hotfix. The cost
-is that "current production" is a `git describe --tags --abbrev=0` away rather
-than a branch checkout, and rollback targets a tag instead of a branch head.
-Both are one command, so the trade favours the tag.
+| Job | Does |
+| --- | --- |
+| `build-and-test` | `setup-dotnet@v4` (8.0.x) -> restore -> `build -c Release` -> `test --no-build` with TRX -> upload results (`if: always()`) |
+| `package` | `dotnet publish -c Release` -> zip -> `upload-artifact@v4` (30-day retention) |
 
-**Release flow.** Cut `release/x.y.0` from `develop` → pushes deploy to STAGING
-behind approval → stabilise on the branch → the *next* branch cut retires it:
-merges it into `develop`, tags that merge commit `vx.y.0` to ship, deletes it,
-and cuts `release/x.y+1.0` in the same operation. Hotfixes are the exception —
-see below.
+**`infra-ci.yml`** — the Bicep template:
 
-### Tagging cadence: at branch cut, not on every merge
+| Job | Does |
+| --- | --- |
+| `validate-bicep` | `az bicep install` -> `az bicep build` (compile to ARM) -> `az bicep lint` |
 
-Tags mark a release, not a commit into `develop`, so they are created only when
-a release/* branch is retired — never as a side effect of an ordinary merge.
-That retirement is automated by a second, separate workflow:
-[`release-branch-lifecycle.yml`](.github/workflows/release-branch-lifecycle.yml),
-triggered manually (`workflow_dispatch`) with four inputs:
+Compiling to ARM is a pure offline operation — no login, no subscription, no credential — which is
+why it can run on a PR from any branch. It is worth being precise about what that does and does not
+prove: `bicep build` catches syntax errors, bad API versions, broken references and parameter type
+errors, but it does **not** prove the template deploys. Name collisions, regional SKU availability,
+quota and RBAC only surface against a real subscription. The next rungs up are
+`az deployment group validate` and `az deployment group what-if` — both need a subscription but
+create nothing, so they belong in an environment-gated job once one exists.
 
-| Input | Required | Example | Meaning |
-| --- | --- | --- | --- |
-| `new_release_version` | yes | `1.1.0` | Creates `release/1.1.0` |
-| `retire_release_branch` | no | `release/1.0.0` | Branch to retire; auto-detected if blank (fails if zero or more than one `release/*` branch exists — ambiguity is never guessed) |
-| `retire_tag_version` | only if retiring | `1.0.0` | Creates tag `v1.0.0` on the outgoing branch |
-| `confirm` | yes | `retire-and-cut` | Must match exactly — this merges, tags, and deletes a branch |
+They are separate so a red check names its own domain — a broken template does not read as a broken
+service — and so each can gain its own required reviewers via `CODEOWNERS` without dragging the
+other along. The cost is that `package` cannot depend on the Bicep gate: GitHub jobs cannot span
+workflows. Branch protection is what actually holds the line, by requiring **both** checks green
+before a merge.
 
-It runs as one strict sequence, and **a failure at any step stops the rest**:
+**No `paths:` filters, deliberately.** A path-filtered workflow that does not trigger never reports
+a status, and a required status check that never reports leaves the PR blocked forever. Both
+workflows finish in about two minutes, so always running them costs far less than that failure
+mode. Adding path filters later means giving every required check an `always()`-guarded gate job to
+report on the skipped path.
 
-1. **Merge** the outgoing `release/*` branch into `develop` (`--no-ff`). This is
-   the carry-over guarantee: if this step fails (a real merge conflict), the
-   job stops here — nothing is tagged, nothing is deleted, and the outgoing
-   branch is untouched. A conflict has to be resolved by hand (a normal PR
-   into `develop`) and the workflow re-run.
-2. **Push** `develop`, now containing everything from the outgoing branch.
-3. **Tag** that merge commit `vX.Y.Z` — this push is what triggers the gated
-   PROD deploy in `backend-ci.yml`.
-4. **Delete** the outgoing `release/*` branch — only now, after 1–3 succeeded.
-5. **Cut** the new `release/<new_release_version>` branch from `develop`'s
-   current tip, so it starts from a state that already includes everything
-   carried over in step 1. Pushing it triggers the gated STAGING deploy.
+**Security posture:**
 
-This is the only workflow in the repository with `contents: write` —
-`backend-ci.yml` stays read-only — and it is `workflow_dispatch`-only with a
-typed confirmation string, since it deletes a branch. First-ever cut (no
-`release/*` branch exists yet) is handled: steps 1–4 are skipped and it goes
-straight to cutting the first branch.
+- **Zero secrets across both workflows**, so a PR from any branch is safe and cannot exfiltrate
+  anything. There is no credential in the pipeline to leak.
+- **Workflow-level least privilege:** `permissions: contents: read`.
+- **Actions pinned** to major version tags (`@v4`), and every job has a `timeout-minutes`.
 
-**Hotfixes are the deliberate exception.** They don't wait for a scheduled
-branch cut — after `hotfix/*` merges into `develop`, a maintainer tags that
-commit directly (`git tag vX.Y.Z && git push origin vX.Y.Z`), per the
-checklist the `hotfix-release-checklist` job prints. Urgency justifies
-bypassing the lifecycle workflow; the next scheduled branch cut still finds
-`develop` in the right state either way.
+### Branch protection — nothing lands without a PR
 
-### Jobs — `backend-ci.yml` (reacts to pushes/tags; `contents: read`)
+**This cannot live in a workflow file.** A workflow runs *after* a push; it cannot refuse one.
+Blocking direct commits is a repository setting, applied to the remote. `develop` and `release/*`
+are the protected branches.
 
-| Job | Does | Needs secrets |
-| --- | --- | --- |
-| `build-and-test` | `setup-dotnet@v4` (8.0.x) → restore → `build -c Release --no-restore` → `test --no-build` with TRX + XPlat coverage → upload results (`if: always()`) | **No** |
-| `validate-iac` | `az bicep install` → `az bicep build --file infra/main.bicep` | **No** |
-| `package` | `dotnet publish src/GameBackend/GameBackend.csproj -c Release -o ./publish` → zip → `upload-artifact@v4` | **No** |
-| `deploy-dev` / `deploy-staging` / `deploy-prod` | download artifact → deploy (documented placeholder) | Yes, via the environment |
+What the rule enforces:
 
-### Job — `release-branch-lifecycle.yml` (manual only; `contents: write`)
+| Setting | Why |
+| --- | --- |
+| Require a pull request before merging | No direct pushes, including by admins |
+| Require status checks: **Build and test**, **Package artifact**, **Validate Bicep** | Both workflows must be green — this is what re-couples the split |
+| Require branches to be up to date before merging | Prevents a merge that passes CI only in isolation |
+| Block force pushes | History on a protected branch stays append-only |
+| Block deletions | The trunk cannot be removed |
+| Include administrators | A rule with an owner-shaped hole is not a rule |
 
-| Job | Does | Needs secrets |
-| --- | --- | --- |
-| `cut` | Validates inputs → merges the outgoing `release/*` branch into `develop` → tags it → deletes it → cuts the next `release/*` branch | **No** — pushes with the workflow's own `GITHUB_TOKEN`, no Azure credentials involved |
-| `hotfix-release-checklist` | Writes the hotfix tag/cherry-pick checklist to the job summary | **No** |
+Applied once per repository, after the remote exists:
 
-### Security posture of the pipeline
+```bash
+gh api -X PUT repos/:owner/:repo/branches/develop/protection \
+  --input - <<'JSON'
+{
+  "required_status_checks": {
+    "strict": true,
+    "contexts": ["Build and test", "Package artifact", "Validate Bicep"]
+  },
+  "required_pull_request_reviews": { "required_approving_review_count": 1 },
+  "enforce_admins": true,
+  "restrictions": null,
+  "allow_force_pushes": false,
+  "allow_deletions": false
+}
+JSON
+```
 
-- **PR checks run with zero secrets.** Nothing on the `build-and-test` → `validate-iac` → `package`
-  path touches Azure, so a PR from any branch is safe and cannot exfiltrate anything.
-- **Workflow-level least privilege:** `permissions: contents: read`. Deploy jobs opt into
-  `id-token: write` only when OIDC federated login is turned on.
-- **Approvals live in GitHub Environments**, not in YAML `if:` conditions — reviewers and environment
-  secrets are configured in repository settings and cannot be bypassed by editing a branch.
-- **No secret is ever echoed.** Deploy steps print intent only; the Azure commands are commented out
-  until a federated credential exists.
-- **Actions are pinned** to major version tags (`@v4`, `@v2`), and every job has a `timeout-minutes`.
-- **Preferred credential:** OIDC federation (`azure/login@v2` with `client-id`/`tenant-id`) so no
-  long-lived service-principal password is stored in GitHub at all.
+The status-check names are the workflow jobs' `name:` values, not the job ids. They only become
+selectable in the GitHub UI once each workflow has completed at least one run, so push first, let
+both go green, then apply the rule.
 
-### Deploying by hand
+On a solo repository, drop `required_pull_request_reviews` — you cannot approve your own PR, and a
+rule you have to bypass to work is worse than one scoped honestly. Everything else still applies.
+
+### Deployment (not automated yet)
+
+**Deployment is deliberately a documented manual step, not a pipeline job.** Automating it would
+require an Azure subscription and a federated credential that this exercise explicitly does not
+assume, and a stubbed deploy job that only echoes its intent is worse than an honest procedure.
+
+Deploy by hand:
 
 ```bash
 az group create -n rg-curlyblue-dev -l westeurope
 
-az deployment group create \
-  -g rg-curlyblue-dev \
-  -f infra/main.bicep \
-  -p environment=dev \
-     playFabTitleId=<titleId> \
-     playFabSecretUri=https://<vault>.vault.azure.net/secrets/playfab-dev-secret-key
+az deployment group create   -g rg-curlyblue-dev   -f infra/main.bicep   -p environment=dev      playFabTitleId=<titleId>      playFabSecretUri=https://<vault>.vault.azure.net/secrets/playfab-dev-secret-key
 
-az functionapp deployment source config-zip \
-  -g rg-curlyblue-dev \
-  -n "$(az deployment group show -g rg-curlyblue-dev -n main \
-         --query properties.outputs.functionAppName.value -o tsv)" \
-  --src GameBackend.zip
+az functionapp deployment source config-zip   -g rg-curlyblue-dev   -n "$(az deployment group show -g rg-curlyblue-dev -n main          --query properties.outputs.functionAppName.value -o tsv)"   --src GameBackend.zip
 ```
 
 The template is **idempotent** — names derive from `uniqueString(resourceGroup().id)`, so re-running
 it updates the same resources rather than creating new ones.
+
+**How it would be gated when automated.** Add one deploy job per environment, each with a GitHub
+`environment:` block — `dev` with no reviewers (continuous), `staging` and `prod` with required
+reviewers, so the job parks on "waiting for approval" rather than deploying unattended. Approvals
+belong in GitHub Environments rather than YAML `if:` conditions, because environment protection
+rules cannot be bypassed by editing a branch. Authenticate with **OIDC federation**
+(`azure/login@v2` with `client-id`/`tenant-id`, job-level `id-token: write`) so no long-lived
+service-principal password is ever stored in GitHub.
 
 ---
 
@@ -472,21 +521,33 @@ it updates the same resources rather than creating new ones.
 
 ### Monitoring and logging
 
-Application Insights is workspace-based and wired via `APPLICATIONINSIGHTS_CONNECTION_STRING`;
-`host.json` sets `telemetryMode: OpenTelemetry`, so worker traces flow through the OTel exporter.
-Function App platform logs and metrics also stream to the same Log Analytics workspace, so one KQL
-query spans traces and platform events.
+Application Insights is workspace-based and wired via `APPLICATIONINSIGHTS_CONNECTION_STRING`, which
+the Bicep template sets from the App Insights resource; the Functions host picks it up and ships
+worker traces with no extra wiring in `Program.cs`. Function App platform logs and metrics stream to
+the same Log Analytics workspace, so one KQL query spans traces and platform events.
 
-Log **structured** properties, never interpolated strings — `entityId`, `questId`, `clientRequestId`,
-`alreadyClaimed`, `rewardAmount`. `clientRequestId` is the correlation handle that stitches a Unity
-client session to a server trace; it is a *log* field only and never a security or dedup decision.
+Both claim outcomes are logged as **structured** properties, never interpolated strings. Each
+`LogInformation` in `DailyRewardService` emits the same property set — `PlayerEntityId`, `QuestId`,
+`ClaimDateUtc`, `IdempotencyKey`, `AlreadyClaimed`, `RewardAmount`, `ClientRequestId` — so one query
+spans the granted and duplicate paths. `ClientRequestId` is the correlation handle that stitches a
+Unity client session to a server trace; it is a *log* field only, never a security or dedup decision.
 
 ```kusto
 // Claim outcomes over the last day
 traces
 | where timestamp > ago(1d)
-| where customDimensions.EventName == "DailyRewardClaim"
-| summarize count() by tostring(customDimensions.alreadyClaimed), bin(timestamp, 1h)
+| extend alreadyClaimed = tostring(customDimensions.AlreadyClaimed)
+| where isnotempty(alreadyClaimed)
+| summarize count() by alreadyClaimed, bin(timestamp, 1h)
+```
+
+```kusto
+// Duplicate grants — the read-then-write race firing in production. Should always be empty.
+traces
+| where timestamp > ago(1d)
+| where tostring(customDimensions.AlreadyClaimed) == "False"
+| summarize grants = count() by key = tostring(customDimensions.IdempotencyKey)
+| where grants > 1
 ```
 
 Alerts worth having on day one:
@@ -497,7 +558,7 @@ Alerts worth having on day one:
 | Server errors | any `5xx` in a 5-minute window | Regression or bad deploy |
 | Latency | P95 duration > 1 s | Cold start or a slow store |
 | Anomalous claims | first-claim count per hour deviates sharply from baseline | Exploit attempt or a stuck reset boundary |
-| Duplicate grants | more than one `rewardAmount: 50` for the same idempotency key | The read-then-write race firing in production |
+| Duplicate grants | the second query above returns any row | The read-then-write race firing in production — the one alert I would want before shipping |
 
 ### Rollback
 
@@ -528,14 +589,8 @@ Note that a soft-delete-enabled Key Vault survives this and must be purged separ
    the read-then-write race described in section 3. Highest priority by far.
 2. **Real PlayFab inventory integration** — implement `ICurrencyWallet` against `PlayFabEconomyAPI`,
    with the developer secret from Key Vault via managed identity.
-3. **Rate limiting** — per-entity throttling so a client loop cannot hammer the endpoint; cheap on
-   Consumption billing and a useful abuse signal.
-4. **Load tests** — verify cold-start latency and concurrent-claim behaviour at the login-hour spike;
-   specifically assert that N concurrent claims for one player grant exactly one reward.
-5. **Premium plan + deployment slots** in prod for slot-swap rollback and no cold starts.
-6. **Integration tests in CI** — spin the Functions host and exercise the full HTTP contract,
-   including the 400/502 table, not just the handler.
-7. **Health endpoint + availability test** — an App Insights availability probe so an outage is
-   detected before players report it.
-8. **Network hardening** — Private Endpoint on storage and Key Vault, `defaultAction: Deny` on the
-   storage firewall once the function runs on a VNet-integrated plan.
+3. **Function-layer tests** — the handler's status mapping and JSON deserialization are currently
+   covered only indirectly. `MapStatusCode` is `internal`, so `InternalsVisibleTo` makes the whole
+   400/502 table a `[Theory]` with no HTTP host.
+4. **Automated deployment** — the gated dev/staging/prod jobs described in section 5, once an OIDC
+   federated credential exists.

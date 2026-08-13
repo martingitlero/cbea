@@ -1,0 +1,132 @@
+### ClaimDailyRewardV1 — runnable request collection
+#
+# Six requests covering the full contract. Run them top to bottom against a local host.
+#
+#   1. cd src/GameBackend && func start
+#   2. Open this file and click "Send Request" above any block.
+#
+# Executes in Visual Studio 2022 (17.8+, built in), JetBrains Rider/IntelliJ (built in),
+# or VS Code with the REST Client extension:  code --install-extension humao.rest-client
+#
+# State is a process-local singleton, so restarting the host resets every balance and
+# claim. Run these twice without restarting and request 1 returns alreadyClaimed.
+#
+# NO FUNCTION KEY IS PRESENT OR NEEDED. Locally the host disables authorization
+# regardless of authLevel. For the deployed variant, see the note at the end of the file.
+
+@baseUrl = http://localhost:7071
+@contentType = application/json
+
+### 1 — First claim of the UTC day grants 50
+# Expect 200: rewardAmount 50, newlyClaimed true, alreadyClaimed false, balance 50,
+# and playerEntityId "title_player_123" — the authenticated entity, NOT the
+# clientPlayerId sent below, which the service binds but never reads.
+
+# @name firstClaim
+POST {{baseUrl}}/api/ClaimDailyRewardV1 HTTP/1.1
+Content-Type: {{contentType}}
+
+{
+  "FunctionArgument": {
+    "questId": "daily_login",
+    "clientRequestId": "request-001",
+    "clientPlayerId": "do-not-trust-this-field"
+  },
+  "CallerEntityProfile": {
+    "Entity": { "Id": "title_player_123", "Type": "title_player_account" }
+  }
+}
+
+### 2 — Identical request again is idempotent
+# Expect 200: rewardAmount 0, alreadyClaimed true, balance unchanged, success still true.
+# A duplicate is a successful no-op rather than an error, so a retrying client does not
+# escalate. The balance returned is the player's real balance, for client reconciliation.
+
+# @name duplicateClaim
+POST {{baseUrl}}/api/ClaimDailyRewardV1 HTTP/1.1
+Content-Type: {{contentType}}
+
+{
+  "FunctionArgument": {
+    "questId": "daily_login",
+    "clientRequestId": "request-001",
+    "clientPlayerId": "do-not-trust-this-field"
+  },
+  "CallerEntityProfile": {
+    "Entity": { "Id": "title_player_123", "Type": "title_player_account" }
+  }
+}
+
+### 3 — A different clientRequestId does not re-grant
+# Expect 200: alreadyClaimed true, rewardAmount 0.
+# Deduplication keys on daily_login:{entityId}:{server UTC date} — every component is
+# server-derived. clientRequestId is client-controlled and is used for tracing only, so
+# varying it cannot produce a second grant.
+
+# @name variedClientRequestId
+POST {{baseUrl}}/api/ClaimDailyRewardV1 HTTP/1.1
+Content-Type: {{contentType}}
+
+{
+  "FunctionArgument": {
+    "questId": "daily_login",
+    "clientRequestId": "a-completely-different-id"
+  },
+  "CallerEntityProfile": {
+    "Entity": { "Id": "title_player_123", "Type": "title_player_account" }
+  }
+}
+
+### 4 — Missing caller entity is rejected
+# Expect 400: errorCode "MissingCallerEntity", success false.
+# The request carries a well-formed clientPlayerId and is still refused: there is no
+# path from client-controlled data to a grant.
+
+# @name missingCallerEntity
+POST {{baseUrl}}/api/ClaimDailyRewardV1 HTTP/1.1
+Content-Type: {{contentType}}
+
+{
+  "FunctionArgument": {
+    "questId": "daily_login",
+    "clientPlayerId": "title_player_123"
+  }
+}
+
+### 5 — Unknown quest is rejected without mutation
+# Expect 400: errorCode "UnknownQuest".
+# The allow-list is checked before any dependency is touched, so a bad quest id cannot
+# consume that player's daily claim. Re-run request 1 with this player id to confirm
+# nothing was recorded.
+
+# @name unknownQuest
+POST {{baseUrl}}/api/ClaimDailyRewardV1 HTTP/1.1
+Content-Type: {{contentType}}
+
+{
+  "FunctionArgument": { "questId": "weekly_login" },
+  "CallerEntityProfile": {
+    "Entity": { "Id": "title_player_999", "Type": "title_player_account" }
+  }
+}
+
+### 6 — Malformed body returns 400, not 500
+# Expect 400: errorCode "BadRequest".
+# JsonException is caught and folded into the same path as an absent body. A 500 here
+# would leak framework internals and signal to a caller that the parser failed.
+
+# @name malformedBody
+POST {{baseUrl}}/api/ClaimDailyRewardV1 HTTP/1.1
+Content-Type: {{contentType}}
+
+this is not json at all
+
+###
+
+# Against a deployed Function App the authLevel is enforced and a function key is required.
+# Read it from the environment so it never enters this file, and send it as a header rather
+# than ?code= — query strings land in server access logs. Use a function-scoped key.
+#
+#   POST https://<app-name>.azurewebsites.net/api/ClaimDailyRewardV1 HTTP/1.1
+#   Content-Type: {{contentType}}
+#   x-functions-key: {{$processEnv CURLYBLUE_FUNCTION_KEY}}

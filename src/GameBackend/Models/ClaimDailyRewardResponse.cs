@@ -3,9 +3,8 @@ using System.Text.Json.Serialization;
 namespace GameBackend.Models;
 
 /// <summary>
-/// Single response shape returned for both success and failure. Every field always
-/// serializes — including explicit nulls — so clients can bind one stable schema and
-/// never have to branch on the presence of a property.
+/// One response shape for both success and failure. Every field always serializes — including
+/// explicit nulls — so a client binds one stable schema instead of branching on presence.
 /// </summary>
 public sealed class ClaimDailyRewardResponse
 {

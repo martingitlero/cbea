@@ -1,27 +1,5 @@
-# ---------------------------------------------------------------------------
-# GameBackend - backend CI/CD (GitFlow)
-#
-#   feature/*  -> PR into develop : build + test + IaC validate
-#   develop    (push)             : full checks + package  -> deploy DEV
-#   release/*  (push)             : full checks + package  -> deploy STAGING (gated)
-#   tag v*                        : deploy PROD (manual approval via environment)
-#   hotfix/*   -> PR into develop : full checks, then cut a patch tag
-#
-# There is deliberately no long-lived `main`. `develop` is the trunk and the
-# repository default branch; what is in production is identified by the most
-# recent `v*` tag, not by a branch pointer. Tags are immutable, so "what shipped"
-# cannot drift the way a mirror branch can.
-#
-# PR checks (build-and-test, validate-iac, package) require ZERO secrets and
-# never touch Azure. Only deploy-* jobs use a GitHub `environment:`, which is
-# where approvals and credentials are attached.
-#
-# This workflow only reacts to branch/tag pushes - it never creates or
-# retires them. That lifecycle (tag the outgoing release/* branch, delete it,
-# cut the next one) lives in the separate, manually-triggered
-# release-branch-lifecycle.yml, which is the only workflow in this repo with
-# `contents: write`.
-# ---------------------------------------------------------------------------
+# Source-code CI — the .NET Functions project. Paired with infra-ci.yml (Bicep).
+# No `paths:` filter and no deploy job, both deliberate; README section 5 has the reasoning.
 name: backend-ci
 
 on:
@@ -29,35 +7,28 @@ on:
     branches:
       - develop
       - 'release/**'
-    tags:
-      - 'v*'
   pull_request:
     branches:
       - develop
+      - 'release/**'
   workflow_dispatch:
 
-# Least privilege for the whole workflow. Deploy jobs opt in to `id-token: write`
-# individually if/when OIDC federated login to Azure is enabled.
+# Least privilege: these jobs only ever read the repo.
 permissions:
   contents: read
 
 concurrency:
-  group: backend-ci-${{ github.workflow }}-${{ github.ref }}
+  group: backend-ci-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   DOTNET_VERSION: '8.0.x'
   DOTNET_NOLOGO: 'true'
-  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: 'true'
   DOTNET_CLI_TELEMETRY_OPTOUT: 'true'
   SOLUTION: GameBackend.sln
   FUNCTION_PROJECT: src/GameBackend/GameBackend.csproj
-  BICEP_TEMPLATE: infra/main.bicep
 
 jobs:
-  # -------------------------------------------------------------------------
-  # 1. Compile + unit tests. Runs on every trigger, no secrets.
-  # -------------------------------------------------------------------------
   build-and-test:
     name: Build and test
     runs-on: ubuntu-latest
@@ -65,19 +36,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Report GitFlow stage
-        run: |
-          {
-            echo "### GitFlow stage"
-            echo ""
-            echo "| field | value |"
-            echo "| --- | --- |"
-            echo "| event | \`${{ github.event_name }}\` |"
-            echo "| ref | \`${{ github.ref_name }}\` |"
-            echo "| base | \`${{ github.base_ref || '-' }}\` |"
-            echo "| head | \`${{ github.head_ref || '-' }}\` |"
-          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
@@ -96,10 +54,9 @@ jobs:
             -c Release \
             --no-build \
             --logger "trx;LogFileName=test-results.trx" \
-            --results-directory ./TestResults \
-            --collect:"XPlat Code Coverage"
+            --results-directory ./TestResults
 
-      - name: Upload test results and coverage
+      - name: Upload test results
         # Upload even when tests fail - the .trx is how you triage the failure.
         if: always()
         uses: actions/upload-artifact@v4
@@ -109,45 +66,13 @@ jobs:
           retention-days: 14
           if-no-files-found: warn
 
-  # -------------------------------------------------------------------------
-  # 2. Infrastructure-as-code validation. Compiles the Bicep to ARM JSON.
-  #    Needs no Azure login, so it is safe on PRs from any branch.
-  # -------------------------------------------------------------------------
-  validate-iac:
-    name: Validate IaC (bicep build)
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      # az is preinstalled on GitHub-hosted runners; `az bicep install` pulls the
-      # Bicep CLI. (Alternative: azure/CLI@v2, which runs az in a container.)
-      - name: Install Bicep CLI
-        run: az bicep install
-
-      - name: Show Bicep version
-        run: az bicep version
-
-      - name: Build Bicep template
-        run: az bicep build --file ${{ env.BICEP_TEMPLATE }} --stdout > /dev/null
-
-      - name: Lint summary
-        if: always()
-        run: echo "Bicep template \`${{ env.BICEP_TEMPLATE }}\` compiled." >> "$GITHUB_STEP_SUMMARY"
-
-  # -------------------------------------------------------------------------
-  # 3. Package the deployable zip.
-  #    Skipped for feature/* PRs into develop (nothing is deployed from those).
-  # -------------------------------------------------------------------------
   package:
     name: Package artifact
-    needs: [build-and-test, validate-iac]
-    if: >-
-      github.event_name == 'push' ||
-      github.event_name == 'workflow_dispatch' ||
-      startsWith(github.head_ref, 'release/') ||
-      startsWith(github.head_ref, 'hotfix/')
+    # Only build-and-test: a GitHub job cannot depend on a job in another
+    # workflow, so the Bicep gate lives entirely in infra-ci.yml. Branch
+    # protection is what makes BOTH workflows green before a merge - see
+    # README section 5.
+    needs: [build-and-test]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -176,140 +101,3 @@ jobs:
           path: GameBackend.zip
           retention-days: 30
           if-no-files-found: error
-
-      - name: Upload IaC template
-        uses: actions/upload-artifact@v4
-        with:
-          name: iac-template
-          path: infra/main.bicep
-          retention-days: 30
-          if-no-files-found: error
-
-  # -------------------------------------------------------------------------
-  # 4a. DEV - every merge into develop. Environment `dev` has no reviewers,
-  #     so this is continuous deployment.
-  # -------------------------------------------------------------------------
-  deploy-dev:
-    name: Deploy to DEV
-    needs: [package]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    environment:
-      name: dev
-    steps:
-      - name: Download function package
-        uses: actions/download-artifact@v4
-        with:
-          name: function-package
-
-      - name: Deploy (documented placeholder)
-        run: |
-          echo "Would deploy GameBackend.zip to the dev Function App."
-          echo "Enable by adding an OIDC federated credential and uncommenting"
-          echo "the azure/login + az functionapp deployment steps below."
-      # Enable once an Azure service principal / OIDC federation exists.
-      # Requires job-level `permissions: { id-token: write, contents: read }`.
-      #
-      # - uses: azure/login@v2
-      #   with:
-      #     client-id: ${{ vars.AZURE_CLIENT_ID }}
-      #     tenant-id: ${{ vars.AZURE_TENANT_ID }}
-      #     subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
-      #
-      # - name: Deploy infrastructure
-      #   run: |
-      #     az deployment group create \
-      #       --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
-      #       --template-file infra/main.bicep \
-      #       --parameters environment=dev \
-      #                    playFabTitleId="${{ vars.PLAYFAB_TITLE_ID }}" \
-      #                    playFabSecretUri="${{ vars.PLAYFAB_SECRET_URI }}"
-      #
-      # - name: Deploy application
-      #   run: |
-      #     az functionapp deployment source config-zip \
-      #       --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
-      #       --name "${{ vars.AZURE_FUNCTIONAPP_NAME }}" \
-      #       --src GameBackend.zip
-
-  # -------------------------------------------------------------------------
-  # 4b. STAGING - every push to a release/* stabilisation branch. Environment
-  #     `staging` carries a required reviewer, so the job parks on "waiting for
-  #     approval" rather than deploying unattended.
-  # -------------------------------------------------------------------------
-  deploy-staging:
-    name: Deploy to STAGING
-    needs: [package]
-    if: >-
-      github.event_name == 'push' &&
-      startsWith(github.ref, 'refs/heads/release/')
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    environment:
-      name: staging
-    steps:
-      - name: Download function package
-        uses: actions/download-artifact@v4
-        with:
-          name: function-package
-
-      - name: Deploy (documented placeholder)
-        run: |
-          echo "Would deploy the release candidate to STAGING."
-          echo "Same steps as deploy-dev with environment=staging."
-          echo "Smoke test after deploy: POST /api/ClaimDailyRewardV1 twice and"
-          echo "assert rewardAmount 50 then 0 with an unchanged balance."
-
-  # -------------------------------------------------------------------------
-  # 4c. PROD - only from a v* tag, behind manual approval. The tag is the sole
-  #     definition of a production release; no branch pointer is involved.
-  # -------------------------------------------------------------------------
-  deploy-prod:
-    name: Deploy to PROD
-    needs: [package]
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    environment:
-      name: prod
-    steps:
-      - name: Download function package
-        uses: actions/download-artifact@v4
-        with:
-          name: function-package
-
-      - name: Deploy (documented placeholder)
-        run: |
-          echo "Would deploy tag ${{ github.ref_name }} to PROD after approval."
-          echo "Prefer a staging-slot deploy followed by a slot swap so rollback"
-          echo "is a swap back rather than a rebuild."
-
-  # -------------------------------------------------------------------------
-  # 5. Hotfix hygiene. Without a `main` mirror a hotfix lands on `develop` and
-  #    is shipped by tagging it, so the historical "back-merge or lose the fix"
-  #    trap disappears. The remaining risk is tagging the wrong commit, which is
-  #    what this checklist guards.
-  # -------------------------------------------------------------------------
-  hotfix-release-checklist:
-    name: Hotfix release checklist
-    needs: [build-and-test, validate-iac]
-    if: >-
-      github.event_name == 'pull_request' &&
-      github.base_ref == 'develop' &&
-      startsWith(github.head_ref, 'hotfix/')
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: Emit release checklist
-        run: |
-          {
-            echo "### Hotfix release checklist"
-            echo ""
-            echo "After merging \`${{ github.head_ref }}\` into \`develop\`:"
-            echo ""
-            echo "1. Confirm the merge commit on \`develop\` is the exact commit you intend to ship."
-            echo "2. Tag that commit \`vX.Y.Z\` (patch bump) to trigger the gated PROD deploy."
-            echo "3. If a \`release/*\` branch is currently open, cherry-pick the fix onto it"
-            echo "   as well so the in-flight release candidate is not shipped without it."
-          } >> "$GITHUB_STEP_SUMMARY"

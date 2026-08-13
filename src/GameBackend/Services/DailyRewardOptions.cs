@@ -26,13 +26,15 @@ public sealed class DailyRewardOptions
     /// </summary>
     public static DailyRewardOptions FromEnvironment()
     {
+        // Defaults live once, on the properties above; this only overrides what is actually set.
+        var defaults = new DailyRewardOptions();
         var currency = Environment.GetEnvironmentVariable("DAILY_REWARD_CURRENCY_ID");
         var rawAmount = Environment.GetEnvironmentVariable("DAILY_REWARD_AMOUNT");
 
         return new DailyRewardOptions
         {
-            CurrencyId = string.IsNullOrWhiteSpace(currency) ? "currency.soft" : currency,
-            Amount = int.TryParse(rawAmount, out var amount) && amount > 0 ? amount : 50,
+            CurrencyId = string.IsNullOrWhiteSpace(currency) ? defaults.CurrencyId : currency,
+            Amount = int.TryParse(rawAmount, out var amount) && amount > 0 ? amount : defaults.Amount,
         };
     }
 }

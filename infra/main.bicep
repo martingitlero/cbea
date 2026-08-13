@@ -75,8 +75,6 @@ var hostingPlanName = '${namePrefix}-plan'
 var appInsightsName = '${namePrefix}-appi'
 var logAnalyticsName = '${namePrefix}-log'
 
-var isProd = environment == 'prod'
-
 // Per-environment choices kept in one map so the delta between environments is
 // reviewable at a glance rather than scattered through the resource bodies.
 var envConfig = {
@@ -180,8 +178,8 @@ resource appInsights 'Microsoft.Insights/components@2020-02-02' = {
     Application_Type: 'web'
     WorkspaceResourceId: logAnalytics.id
     IngestionMode: 'LogAnalytics'
-    // Ingestion keys are disabled: the worker exports via the connection string
-    // over OpenTelemetry (see host.json telemetryMode), not an instrumentation key.
+    // The Functions host exports via APPLICATIONINSIGHTS_CONNECTION_STRING below,
+    // not via a legacy instrumentation key.
     DisableLocalAuth: false
     publicNetworkAccessForIngestion: 'Enabled'
     publicNetworkAccessForQuery: 'Enabled'
@@ -324,26 +322,11 @@ resource functionAppDiagnostics 'Microsoft.Insights/diagnosticSettings@2021-05-0
 // Outputs (identifiers only - never secrets)
 // ---------------------------------------------------------------------------
 
-@description('Name of the deployed Function App, for use by the CD deploy step.')
+@description('Name of the deployed Function App, for use by a future CD deploy step.')
 output functionAppName string = functionApp.name
-
-@description('Default hostname; the endpoint is https://<hostname>/api/ClaimDailyRewardV1')
-output functionAppDefaultHostName string = functionApp.properties.defaultHostName
 
 @description('Full URL of the ClaimDailyRewardV1 endpoint to register in PlayFab.')
 output claimDailyRewardUrl string = 'https://${functionApp.properties.defaultHostName}/api/ClaimDailyRewardV1'
 
 @description('System-assigned managed identity principal id. Grant this Key Vault secret read access.')
 output functionAppPrincipalId string = functionApp.identity.principalId
-
-@description('Application Insights resource name for dashboards and alert rules.')
-output appInsightsName string = appInsights.name
-
-@description('Storage account backing the Functions host.')
-output storageAccountName string = storageAccount.name
-
-@description('Resource group the stack was deployed into (used by rollback / cleanup docs).')
-output resourceGroupName string = resourceGroup().name
-
-@description('Prod deploys should be gated on a manual approval in the GitHub environment.')
-output requiresManualApproval bool = isProd

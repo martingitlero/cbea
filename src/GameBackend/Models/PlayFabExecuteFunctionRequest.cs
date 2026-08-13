@@ -3,10 +3,16 @@ using System.Text.Json.Serialization;
 namespace GameBackend.Models;
 
 /// <summary>
-/// Payload PlayFab CloudScript posts to an <c>ExecuteFunction</c> HTTP trigger.
-/// The envelope is PascalCase while the function argument body is camelCase, so every
-/// property is bound explicitly rather than relying on global serializer configuration.
+/// Payload PlayFab CloudScript posts to an <c>ExecuteFunction</c> HTTP trigger. The envelope is
+/// PascalCase while the function argument body is camelCase, so every property is bound explicitly
+/// rather than relying on global serializer configuration.
 /// </summary>
+/// <remarks>
+/// <c>TitleAuthenticationContext</c> is deliberately not modelled: nothing here reads it, and
+/// unmapped JSON properties are ignored, so a real PlayFab payload still binds. Verifying the
+/// title entity token would belong here if this function ever trusted the title rather than the
+/// caller entity.
+/// </remarks>
 public sealed class PlayFabExecuteFunctionRequest
 {
     [JsonPropertyName("FunctionArgument")]
@@ -14,9 +20,6 @@ public sealed class PlayFabExecuteFunctionRequest
 
     [JsonPropertyName("CallerEntityProfile")]
     public CallerEntityProfile? CallerEntityProfile { get; set; }
-
-    [JsonPropertyName("TitleAuthenticationContext")]
-    public TitleAuthenticationContext? TitleAuthenticationContext { get; set; }
 }
 
 /// <summary>
@@ -29,19 +32,16 @@ public sealed class FunctionArgument
     public string? QuestId { get; set; }
 
     /// <summary>
-    /// Correlation identifier used for tracing and log stitching only. It is never used
-    /// as the idempotency/dedup key, because a client controls its value and could
-    /// vary it to replay a claim.
+    /// Tracing and log stitching only — never the dedup key, since a client controls its value
+    /// and could vary it to replay a claim.
     /// </summary>
     [JsonPropertyName("clientRequestId")]
     public string? ClientRequestId { get; set; }
 
     /// <summary>
-    /// Deliberately bound so the shape of the client payload is explicit, but NEVER read
-    /// by server logic. This value is client-owned; trusting it would let any player pass
-    /// another player's identifier and claim rewards on their behalf (impersonation).
-    /// The authoritative player identity is <see cref="CallerEntity.Id"/>, which PlayFab
-    /// populates from the authenticated entity token.
+    /// Bound so the client payload's shape is explicit, but NEVER read by server logic: trusting
+    /// it would let any player claim on another player's behalf. The authoritative identity is
+    /// <see cref="CallerEntity.Id"/>.
     /// </summary>
     [JsonPropertyName("clientPlayerId")]
     public string? ClientPlayerId { get; set; }
@@ -66,16 +66,4 @@ public sealed class CallerEntity
 
     [JsonPropertyName("Type")]
     public string? Type { get; set; }
-}
-
-/// <summary>
-/// Title-level authentication context supplied by PlayFab when invoking the function.
-/// </summary>
-public sealed class TitleAuthenticationContext
-{
-    [JsonPropertyName("Id")]
-    public string? Id { get; set; }
-
-    [JsonPropertyName("EntityToken")]
-    public string? EntityToken { get; set; }
 }

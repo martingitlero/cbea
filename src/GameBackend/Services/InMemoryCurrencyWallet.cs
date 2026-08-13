@@ -10,26 +10,15 @@ public sealed class InMemoryCurrencyWallet : ICurrencyWallet
 {
     private readonly ConcurrentDictionary<(string PlayerEntityId, string CurrencyId), int> _balances = new();
 
-    /// <summary>Creates an empty wallet: every player starts at a zero balance.</summary>
+    /// <summary>Creates an empty wallet: every player starts at a zero balance. Used by DI.</summary>
     public InMemoryCurrencyWallet()
     {
     }
 
     /// <summary>
-    /// Creates a wallet pre-seeded with starting balances, so tests can assert that a grant
+    /// Creates a wallet holding a single seeded balance, so a test can assert that a grant
     /// adds to an existing balance rather than overwriting it.
     /// </summary>
-    public InMemoryCurrencyWallet(IEnumerable<KeyValuePair<(string PlayerEntityId, string CurrencyId), int>> initialBalances)
-    {
-        ArgumentNullException.ThrowIfNull(initialBalances);
-
-        foreach (var (key, balance) in initialBalances)
-        {
-            _balances[key] = balance;
-        }
-    }
-
-    /// <summary>Creates a wallet holding a single seeded balance for one player and currency.</summary>
     public InMemoryCurrencyWallet(string playerEntityId, string currencyId, int initialBalance)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(playerEntityId);

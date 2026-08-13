@@ -12,16 +12,14 @@ namespace GameBackend.Functions;
 /// HTTP entry point invoked by PlayFab <c>ExecuteFunction</c>.
 /// </summary>
 /// <remarks>
-/// This type is intentionally thin. It owns exactly two concerns — turning the
-/// request body into a DTO, and turning a domain error code into an HTTP status
-/// — so that every business rule stays in <see cref="IDailyRewardService"/>
-/// where it can be tested without a function host.
+/// Owns two concerns only — body to DTO, and domain error code to HTTP status — so every business
+/// rule stays in <see cref="IDailyRewardService"/>, testable without a function host.
 /// </remarks>
 public sealed class ClaimDailyRewardV1Function
 {
     /// <summary>
-    /// Case-insensitive to tolerate casing drift between PlayFab's envelope
-    /// (PascalCase) and the client-authored function argument (camelCase).
+    /// Case-insensitive to tolerate casing drift between PlayFab's envelope (PascalCase) and the
+    /// client-authored function argument (camelCase).
     /// </summary>
     private static readonly JsonSerializerOptions SerializerOptions = new()
     {
@@ -65,10 +63,8 @@ public sealed class ClaimDailyRewardV1Function
         }
         catch (JsonException ex)
         {
-            // Deliberately swallowed into the null path below: a malformed body
-            // and an absent body are the same BadRequest to the caller, and the
-            // service already owns that response shape. Letting the exception
-            // escape would surface an untyped 500 instead.
+            // Swallowed into the null path below: malformed and absent bodies are the same
+            // BadRequest, and letting this escape would surface an untyped 500 instead.
             _logger.LogWarning(ex, "Malformed ClaimDailyRewardV1 request body.");
         }
 
@@ -83,8 +79,7 @@ public sealed class ClaimDailyRewardV1Function
     }
 
     /// <summary>
-    /// Maps a domain error code to its HTTP status. The unknown-code arm returns
-    /// 500 so that a newly added error code fails loudly rather than silently
+    /// The unknown-code arm returns 500 so a newly added error code fails loudly rather than
     /// masquerading as a success.
     /// </summary>
     internal static int MapStatusCode(string? errorCode) => errorCode switch
